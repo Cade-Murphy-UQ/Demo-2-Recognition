@@ -129,19 +129,18 @@ class CNNVAE(nn.Module):
         recon = self.decode(z)
         return recon, mu, logvar
 
-def vae_loss_function(recon_x, x, mu, logvar, beta=1.0):
-    """
-    VAE loss = Reconstruction loss + KL divergence
-    beta: weight for KL divergence (beta-VAE)
-    """
-    # Reconstruction loss (Binary Cross Entropy)
-    BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
 
-    # KL divergence loss
-    # KLD = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+ce_loss = nn.CrossEntropyLoss()
 
-    return BCE + beta * KLD, BCE, KLD
+def dice_loss(logits, target, eps=1e-6):
+    probs = torch.softmax(logits, dim=1)
+    tgt1h = torch.nn.functional.one_hot(target, probs.shape[1])
+    tgt1h = tgt1h.permute(0,3,1,2).float()
+    dims = (0,2,3)
+    inter = (probs * tgt1h).sum(dims)
+    union = probs.sum(dims) + tgt1h.sum(dims)
+    dice  = (2*inter + eps) / (union + eps)
+    return 1.0 - dice.mean()
 
 
 import matplotlib.pyplot as plt
