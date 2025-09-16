@@ -49,10 +49,6 @@ testset  = FlatPngDataset(val_root,   size=(28, 28))
 train_loader = DataLoader(trainset, batch_size=128, shuffle=True)
 test_loader  = DataLoader(testset,  batch_size=128, shuffle=False)
 
-# quick sanity check
-xb, yb = next(iter(train_loader))
-print("train batch:", xb.shape, "unique labels:", yb.unique())
-
 class CNNVAE(nn.Module):
     def __init__(self, latent_dim=32):
         super().__init__()

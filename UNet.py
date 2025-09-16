@@ -17,41 +17,35 @@ if not torch.cuda.is_available():
 num_epochs = 8
 learning_rate = 1e-3
 
-class FlatPngDataset(Dataset):
-    def __init__(self, root, size=(28, 28)):
-        self.paths = [os.path.join(root, f)
-                      for f in os.listdir(root)
-                      if f.lower().endswith(".png")]
+class FlatPngSegDataset(Dataset):
+    def __init__(self, img_root, mask_root, size=(256,256)):
+        self.imgs  = sorted([os.path.join(img_root,  f) for f in os.listdir(img_root)  if f.endswith(".png")])
+        self.masks = sorted([os.path.join(mask_root, f) for f in os.listdir(mask_root) if f.endswith(".png")])
+        assert len(self.imgs) == len(self.masks), "mismatch images/masks"
         self.size = size
 
-    def __len__(self):
-        return len(self.paths)
+    def __len__(self): return len(self.imgs)
 
-    def __getitem__(self, idx):
-        # read_image -> uint8 [C,H,W], C can be 1 (grayscale) or 3/4 (RGB/RGBA)
-        x = read_image(self.paths[idx]).float() / 255.0  # -> [C,H,W] in [0,1]
-        if x.size(0) == 3:           # RGB -> gray
-            x = x.mean(0, keepdim=True)
-        elif x.size(0) == 4:         # RGBA -> RGB -> gray
-            x = x[:3].mean(0, keepdim=True)
-        # ensure 28x28
-        x = F.interpolate(x.unsqueeze(0), size=self.size, mode="bilinear",
-                          align_corners=False).squeeze(0)
-        return x, 0                   # dummy label
+    def __getitem__(self, i):
+        x = read_image(self.imgs[i]).float()/255.0          # [C,H,W], 0..1
+        if x.size(0) >= 3: x = x[:3].mean(0, keepdim=True)  # grayscale
+        x = F.interpolate(x.unsqueeze(0), self.size, mode="bilinear", align_corners=False).squeeze(0)
+
+        y = read_image(self.masks[i])[0].long()             # take single channel as labels
+        y = F.interpolate(y[None,None].float(), self.size, mode="nearest").squeeze(0).squeeze(0).long()
+        return x, y
     
 
-train_root = "../keras_png_slices_data/keras_png_slices_train"
-val_root   = "../keras_png_slices_data/keras_png_slices_validate"
+img_tr = "../keras_png_slices_data/keras_png_slices_train"
+msk_tr = "../keras_png_slices_data/keras_png_slices_seg_train"
+img_va = "../keras_png_slices_data/keras_png_slices_validate"
+msk_va = "../keras_png_slices_data/keras_png_slices_seg_validate"
 
-trainset = FlatPngDataset(train_root, size=(28, 28))
-testset  = FlatPngDataset(val_root,   size=(28, 28))
+trainset = FlatPngSegDataset(img_tr, msk_tr, size=(256,256))
+valset   = FlatPngSegDataset(img_va, msk_va, size=(256,256))
+train_loader = DataLoader(trainset, batch_size=8, shuffle=True)
+val_loader   = DataLoader(valset,   batch_size=8, shuffle=False)
 
-train_loader = DataLoader(trainset, batch_size=128, shuffle=True)
-test_loader  = DataLoader(testset,  batch_size=128, shuffle=False)
-
-# quick sanity check
-xb, yb = next(iter(train_loader))
-print("train batch:", xb.shape, "unique labels:", yb.unique())
 
 class CNNVAE(nn.Module):
     def __init__(self, latent_dim=32):
