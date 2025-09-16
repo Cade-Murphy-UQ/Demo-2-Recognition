@@ -190,30 +190,43 @@ for epoch in range(num_vae_epochs):
 
     print(f'VAE Epoch [{epoch+1}/{num_vae_epochs}], Loss: {avg_loss:.4f}, BCE: {avg_bce:.4f}, KLD: {avg_kld:.4f}')
 
-    # Visualize reconstructions every few epochs
-    if (epoch + 1) % 1 == 0 or epoch == 0:
-        vae.eval()
-        with torch.no_grad():
-            test_images, _ = next(iter(test_loader))
-            test_images = test_images.to(device)
-            recon_images, _, _ = vae(test_images)
 
-            # Plot original vs reconstructed
-            fig, axes = plt.subplots(2, 10, figsize=(20, 4))
-            for i in range(10):
-                # Original
-                axes[0, i].imshow(test_images[i].cpu().squeeze(), cmap='gray')
-                axes[0, i].axis('off')
-                if i == 0:
-                    axes[0, i].set_ylabel('Original', fontsize=12)
+# Manifold visualisation
 
-                # Reconstructed
-                axes[1, i].imshow(recon_images[i].cpu().squeeze(), cmap='gray')
-                axes[1, i].axis('off')
-                if i == 0:
-                    axes[1, i].set_ylabel('Reconstructed', fontsize=12)
 
-            plt.suptitle(f'VAE Reconstructions - Epoch {epoch+1}', fontsize=14)
-            plt.tight_layout()
-            plt.show()
+def plot_decoder_manifold_grid(model, latent_dim, device,
+                               n=15, lim=3.0,
+                               savepath="outputs/vae_manifold_grid.png",
+                               title="Decoder samples over 2D latent grid"):
+    """
+    Create an n x n grid by sweeping the first two latent dims in [-lim, lim],
+    fixing all other latent dims to 0, and decoding each point.
+    """
+    model.eval()
+    os.makedirs("outputs", exist_ok=True)
 
+    grid_x = torch.linspace(-lim, lim, n)
+    grid_y = torch.linspace(-lim, lim, n)
+
+    fig, axes = plt.subplots(n, n, figsize=(n, n))
+    with torch.no_grad():
+        for i, yi in enumerate(grid_y):
+            for j, xi in enumerate(grid_x):
+                z = torch.zeros(1, latent_dim, device=device)   # [1, D]
+                z[0, 0] = xi
+                z[0, 1] = yi
+                xhat = model.decode(z).cpu().squeeze()          # [H,W] since 1-channel
+                axes[i, j].imshow(xhat.numpy(), cmap="gray", vmin=0, vmax=1)
+                axes[i, j].axis("off")
+
+    plt.suptitle(title, y=1.02, fontsize=12)
+    plt.tight_layout(pad=0.05)
+    plt.savefig(savepath, dpi=200, bbox_inches="tight")
+    print("Saved:", savepath)
+    plt.show()
+
+
+plot_decoder_manifold_grid(vae, vae.latent_dim, device,
+                           n=15, lim=3.0,
+                           savepath="outputs/vae_manifold_grid.png",
+                           title="VAE manifold (dims 0 & 1; others=0)")
