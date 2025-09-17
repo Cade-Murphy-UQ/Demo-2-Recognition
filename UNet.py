@@ -32,12 +32,10 @@ class FlatPngSegDataset(Dataset):
         if x.size(0) >= 3: x = x[:3].mean(0, keepdim=True)
         x = F.interpolate(x.unsqueeze(0), self.size, mode="bilinear", align_corners=False).squeeze(0)
 
-        # mask -> [H,W] in {0,1}
-        m = read_image(self.masks[i])[0:1].float()                  # [1,H,W] in [0,255]
-        m = F.interpolate(m.unsqueeze(0), self.size, mode="nearest").squeeze(0)  # keep 0/255
         lab = read_image(self.masks[i])[0:1].long()            # [1,H,W] uint/long
         lab = F.interpolate(lab.float().unsqueeze(0), self.size, mode="nearest").squeeze(0).long()  # keep ids
         y = lab.squeeze(0)    
+        
         return x, y
     
 
@@ -82,21 +80,21 @@ class UNetCNN(nn.Module):
         ) 
 
         # Decoder
-        self.up3  = nn.ConvTranspose2d(256, 128, 2, stride=2)  # 32 -> 64
+        self.up3  = nn.ConvTranspose2d(256, 128, 2, stride=2)                  # 32→64
         self.dec3 = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128 + 128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
             nn.Dropout2d(0.2)
         )
 
-        self.up2  = nn.ConvTranspose2d(128, 64, 2, stride=2)   # 64 -> 128
+        self.up2  = nn.ConvTranspose2d(128, 64, 2, stride=2)                   # 64→128
         self.dec2 = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64 + 64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
             nn.Dropout2d(0.2)
         )
 
-        self.up1  = nn.ConvTranspose2d(64, 32, 2, stride=2)    # 128 -> 256
+        self.up1  = nn.ConvTranspose2d(64, 32, 2, stride=2)                    # 128→256
         self.dec1 = nn.Sequential(
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32 + 32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
             nn.Dropout2d(0.2)
         )
 
@@ -110,16 +108,25 @@ class UNetCNN(nn.Module):
         xb = self.bottleneck(self.pool3(x3))  # [B,256, 32, 32]
         return x1, x2, x3, xb
     
-    def decode(self, xb):
-        y = self.up3(xb); y = self.dec3(y)      # -> [B,128, 64, 64]
-        y = self.up2(y);  y = self.dec2(y)      # -> [B, 64,128,128]
-        y = self.up1(y);  y = self.dec1(y)      # -> [B, 32,256,256]
-        return self.outc(y)                     # -> [B,C,256,256]
+    def decode(self, x1, x2, x3, xb):
+        y = self.up3(xb)                            # [B,128, 64, 64]
+        y = torch.cat([y, x3], dim=1)               # [B,256, 64, 64]
+        y = self.dec3(y)                            # [B,128, 64, 64]
+
+        y = self.up2(y)                             # [B, 64,128,128]
+        y = torch.cat([y, x2], dim=1)               # [B,128,128,128]
+        y = self.dec2(y)                            # [B, 64,128,128]
+
+        y = self.up1(y)                             # [B, 32,256,256]
+        y = torch.cat([y, x1], dim=1)               # [B, 64,256,256]
+        y = self.dec1(y)                            # [B, 32,256,256]
+
+        return self.outc(y)                         # [B,C,256,256]
 
     # forward: head at 32×32, then upsample back to H×W
     def forward(self, x):
         x1, x2, x3, xb = self.encode(x)
-        return self.decode(xb)
+        return self.decode(x1, x2, x3, xb)
 
 
 ce_loss = nn.CrossEntropyLoss()
