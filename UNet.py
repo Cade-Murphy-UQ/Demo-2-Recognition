@@ -115,7 +115,8 @@ class UNetCNN(nn.Module):
 
     # forward: head at 32×32, then upsample back to H×W
     def forward(self, x):
-        return 
+        x1, x2, x3, xb = self.encode(x)
+        return self.decode(xb)
 
 
 ce_loss = nn.CrossEntropyLoss()
@@ -131,83 +132,17 @@ def dice_loss(logits, target, eps=1e-6):
     return 1.0 - dice.mean()
 
 
-import matplotlib.pyplot as plt
-# Train the VAE
-vae = CNNVAE(latent_dim=32).to(device)
-vae_optimizer = torch.optim.Adam(vae.parameters(), lr=learning_rate)
-
 # Training loop
-num_vae_epochs = 10
-beta = 1.0  # Beta parameter for beta-VAE (1.0 = standard VAE)
+net = UNetCNN(n_classes).to(device)
+opt = torch.optim.Adam(net.parameters(), lr=learning_rate)
 
-print("Training VAE...")
-for epoch in range(num_vae_epochs):
-    vae.train()
-    total_loss = 0
-    total_bce = 0
-    total_kld = 0
-
-    for batch_idx, (images, _) in enumerate(train_loader):
-        images = images.to(device)
-
-        # Forward pass
-        recon_images, mu, logvar = vae(images)
-
-        # Calculate loss
-        loss, bce, kld = vae_loss_function(recon_images, images, mu, logvar, beta)
-
-        # Backward pass
-        vae_optimizer.zero_grad()
-        loss.backward()
-        vae_optimizer.step()
-
-        total_loss += loss.item()
-        total_bce += bce.item()
-        total_kld += kld.item()
-
-    avg_loss = total_loss / len(train_loader.dataset)
-    avg_bce = total_bce / len(train_loader.dataset)
-    avg_kld = total_kld / len(train_loader.dataset)
-
-    print(f'VAE Epoch [{epoch+1}/{num_vae_epochs}], Loss: {avg_loss:.4f}, BCE: {avg_bce:.4f}, KLD: {avg_kld:.4f}')
-
-
-# Manifold visualisation
-
-
-def plot_decoder_manifold_grid(model, latent_dim, device,
-                               n=15, lim=3.0,
-                               savepath="outputs/vae_manifold_grid.png",
-                               title="Decoder samples over 2D latent grid"):
-    """
-    Create an n x n grid by sweeping the first two latent dims in [-lim, lim],
-    fixing all other latent dims to 0, and decoding each point.
-    """
-    model.eval()
-    os.makedirs("outputs", exist_ok=True)
-
-    grid_x = torch.linspace(-lim, lim, n)
-    grid_y = torch.linspace(-lim, lim, n)
-
-    fig, axes = plt.subplots(n, n, figsize=(n, n))
-    with torch.no_grad():
-        for i, yi in enumerate(grid_y):
-            for j, xi in enumerate(grid_x):
-                z = torch.zeros(1, latent_dim, device=device)   # [1, D]
-                z[0, 0] = xi
-                z[0, 1] = yi
-                xhat = model.decode(z).cpu().squeeze()          # [H,W] since 1-channel
-                axes[i, j].imshow(xhat.numpy(), cmap="gray", vmin=0, vmax=1)
-                axes[i, j].axis("off")
-
-    plt.suptitle(title, y=1.02, fontsize=12)
-    plt.tight_layout(pad=0.05)
-    plt.savefig(savepath, dpi=200, bbox_inches="tight")
-    print("Saved:", savepath)
-    plt.show()
-
-
-plot_decoder_manifold_grid(vae, vae.latent_dim, device,
-                           n=15, lim=3.0,
-                           savepath="outputs/vae_manifold_grid.png",
-                           title="VAE manifold (dims 0 & 1; others=0)")
+for epoch in range(10):
+    net.train(); running=0.0
+    for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+        opt.zero_grad()
+        logits = net(x)
+        loss = ce_loss(logits, y) + 0.5 * dice_loss(logits, y)
+        loss.backward(); opt.step()
+        running += loss.item() * x.size(0)
+    print(f"epoch {epoch+1}: train_loss={running/len(trainset):.4f}")
