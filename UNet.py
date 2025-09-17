@@ -21,18 +21,23 @@ class FlatPngSegDataset(Dataset):
     def __init__(self, img_root, mask_root, size=(256,256)):
         self.imgs  = sorted([os.path.join(img_root,  f) for f in os.listdir(img_root)  if f.endswith(".png")])
         self.masks = sorted([os.path.join(mask_root, f) for f in os.listdir(mask_root) if f.endswith(".png")])
-        assert len(self.imgs) == len(self.masks), "mismatch images/masks"
+        assert len(self.imgs) == len(self.masks)
         self.size = size
 
     def __len__(self): return len(self.imgs)
 
     def __getitem__(self, i):
-        x = read_image(self.imgs[i]).float()/255.0          # [C,H,W], 0..1
-        if x.size(0) >= 3: x = x[:3].mean(0, keepdim=True)  # grayscale
+        # image -> [1,H,W] in [0,1]
+        x = read_image(self.imgs[i]).float() / 255.0
+        if x.size(0) >= 3: x = x[:3].mean(0, keepdim=True)
         x = F.interpolate(x.unsqueeze(0), self.size, mode="bilinear", align_corners=False).squeeze(0)
 
-        y = read_image(self.masks[i])[0].long()             # take single channel as labels
-        y = F.interpolate(y[None,None].float(), self.size, mode="nearest").squeeze(0).squeeze(0).long()
+        # mask -> [H,W] in {0,1}
+        m = read_image(self.masks[i])[0:1].float()                  # [1,H,W] in [0,255]
+        m = F.interpolate(m.unsqueeze(0), self.size, mode="nearest").squeeze(0)  # keep 0/255
+        lab = read_image(self.masks[i])[0:1].long()            # [1,H,W] uint/long
+        lab = F.interpolate(lab.float().unsqueeze(0), self.size, mode="nearest").squeeze(0).long()  # keep ids
+        y = lab.squeeze(0)    
         return x, y
     
 
@@ -46,9 +51,7 @@ valset   = FlatPngSegDataset(img_va, msk_va, size=(256,256))
 train_loader = DataLoader(trainset, batch_size=8, shuffle=True)
 val_loader   = DataLoader(valset,   batch_size=8, shuffle=False)
 
-xb, yb = next(iter(train_loader))
-n_classes = int(yb.max().item() + 1)
-print("n_classes:", n_classes)
+n_classes = 4 #since tehre are 4 labels
 
 class UNetCNN(nn.Module):
     def __init__(self, n_classes):
@@ -131,6 +134,48 @@ def dice_loss(logits, target, eps=1e-6):
     dice  = (2*inter + eps) / (union + eps)
     return 1.0 - dice.mean()
 
+def dice_per_class(logits: torch.Tensor, y: torch.Tensor, n_classes: int, eps: float = 1e-6):
+    probs = torch.softmax(logits, dim=1)                       # [B,C,H,W]
+    y1h   = torch.nn.functional.one_hot(y, n_classes).permute(0,3,1,2).float()  # [B,C,H,W]
+    dims  = (0,2,3)                                            # sum over batch & pixels
+    inter = (probs * y1h).sum(dims)                            # [C]
+    union = probs.sum(dims) + y1h.sum(dims)                    # [C]
+    return (2*inter + eps) / (union + eps)                     # [C]
+
+def evaluate(net: nn.Module, loader: DataLoader, n_classes: int):
+    net.eval()
+    ce_sum = 0.0
+    px_correct = 0
+    px_total   = 0
+
+    # accumulate exact Dice numerators/denominators
+    inter_sum = torch.zeros(n_classes, device=device)
+    union_sum = torch.zeros(n_classes, device=device)
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = net(x)
+
+        # CE
+        ce_sum += ce_loss(logits, y).item() * x.size(0)
+
+        # pixel accuracy
+        pred = logits.argmax(1)                   # [B,H,W]
+        px_correct += (pred == y).sum().item()
+        px_total   += y.numel()
+
+        # per-class Dice accumulators
+        probs = torch.softmax(logits, dim=1)      # [B,C,H,W]
+        y1h   = torch.nn.functional.one_hot(y, n_classes).permute(0,3,1,2).float()
+        dims  = (0,2,3)
+        inter_sum += (probs * y1h).sum(dims)
+        union_sum += probs.sum(dims) + y1h.sum(dims)
+
+    ce_avg  = ce_sum / len(loader.dataset)
+    acc_px  = px_correct / px_total
+    dice_pc = (2*inter_sum / union_sum.clamp_min(1e-6)).detach().cpu().tolist()
+    return ce_avg, acc_px, dice_pc
+
 
 # Training loop
 net = UNetCNN(n_classes).to(device)
@@ -142,7 +187,12 @@ for epoch in range(10):
         x, y = x.to(device), y.to(device)
         opt.zero_grad()
         logits = net(x)
-        loss = ce_loss(logits, y) + 0.5 * dice_loss(logits, y)
-        loss.backward(); opt.step()
+        loss = ce_loss(logits, y) + 0.5 * dice_loss(logits, y)   # keep CE + Dice loss for stability
+        loss.backward()
+        opt.step()
         running += loss.item() * x.size(0)
-    print(f"epoch {epoch+1}: train_loss={running/len(trainset):.4f}")
+
+    # evaluate on validation set
+    ce_v, acc_v, dice_pc = evaluate(net, val_loader, n_classes)
+    print(f"epoch {epoch+1:02d} | train_loss {running/len(trainset):.4f} "
+          f"| val_CE {ce_v:.4f} | val_pxAcc {acc_v:.3f} | val_DSC per-class {dice_pc}")
