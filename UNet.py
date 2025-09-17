@@ -52,82 +52,49 @@ class CNNVAE(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Encoder (same as before but outputs mean and log_var)
-        self.encoder_conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),  # 28x28 -> 28x28
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Dropout2d(0.2),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 28x28 -> 14x14
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Dropout2d(0.2)
+        )                       # 256 -> 256
+        self.pool1 = nn.MaxPool2d(2)   # 256 -> 128
 
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),  # 14x14 -> 14x14
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Dropout2d(0.2),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 14x14 -> 7x7
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Dropout2d(0.2)
+        )                       # 128 -> 128
+        self.pool2 = nn.MaxPool2d(2)   # 128 -> 64
 
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # 7x7 -> 7x7
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Dropout2d(0.2),
-            nn.MaxPool2d(kernel_size=2, stride=2, padding=1),  # 7x7 -> 4x4
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Dropout2d(0.2)
+        )                       # 64 -> 64
+        self.pool3 = nn.MaxPool2d(2)   # 64 -> 32
 
-            nn.Flatten(),
-        )
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.Dropout2d(0.2)
+        ) 
 
         # Latent space parameters
         self.fc_mu = nn.Linear(128 * 4 * 4, latent_dim)      # Mean
         self.fc_logvar = nn.Linear(128 * 4 * 4, latent_dim)  # Log variance
 
         # Decoder
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 128 * 4 * 4),
-            nn.ReLU(),
-            nn.Unflatten(1, (128, 4, 4)),  # Reshape to (batch, 128, 4, 4)
-
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),  # 4x4 -> 8x8
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Dropout2d(0.2),
-
-            nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),  # 8x8 -> 16x16
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Dropout2d(0.2),
-
-            nn.ConvTranspose2d(32, 1, kernel_size=3, stride=1, padding=1),  # 16x16 -> 16x16
-            nn.Upsample(size=(28, 28), mode='bilinear', align_corners=False),  # 16x16 -> 28x28
-            nn.Sigmoid()  # Output in [0, 1] for image reconstruction
-        )
-
+        
+    #  encode returns feature maps
     def encode(self, x):
-        """Encode input to latent parameters"""
-        h = self.encoder_conv(x)
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
+        x1 = self.enc1(x)                 # [B, 32, 256, 256]
+        x2 = self.enc2(self.pool1(x1))    # [B, 64, 128, 128]
+        x3 = self.enc3(self.pool2(x2))    # [B,128,  64,  64]
+        xb = self.bottleneck(self.pool3(x3))  # [B,256, 32, 32]
+        return x1, x2, x3, xb
 
-    def reparameterize(self, mu, logvar):
-        """Reparameterization trick: sample from N(mu, var) using N(0,1)"""
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        else:
-            return mu  # Use mean for inference. Using mu (mean) rather than sampling from the full distribution because:
-                        # It provides deterministic, reproducible results
-                        # The mean represents the "most likely" latent representation
-                        # It avoids noise that could make interpolation less smooth
-
-    def decode(self, z):
-        """Decode latent variable to reconstruction"""
-        return self.decoder(z)
-
+    # forward: head at 32×32, then upsample back to H×W
     def forward(self, x):
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        recon = self.decode(z)
-        return recon, mu, logvar
+        x1, x2, x3, xb = self.encode(x)
+        logits32 = self.out_head(xb)  # [B, C, 32, 32]
+        return F.interpolate(logits32, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
 
 ce_loss = nn.CrossEntropyLoss()
