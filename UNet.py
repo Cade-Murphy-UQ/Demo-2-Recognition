@@ -46,11 +46,13 @@ valset   = FlatPngSegDataset(img_va, msk_va, size=(256,256))
 train_loader = DataLoader(trainset, batch_size=8, shuffle=True)
 val_loader   = DataLoader(valset,   batch_size=8, shuffle=False)
 
+xb, yb = next(iter(train_loader))
+n_classes = int(yb.max().item() + 1)
+print("n_classes:", n_classes)
 
-class CNNVAE(nn.Module):
-    def __init__(self, latent_dim=32):
+class UNetCNN(nn.Module):
+    def __init__(self, n_classes):
         super().__init__()
-        self.latent_dim = latent_dim
 
         # Encoder
         self.enc1 = nn.Sequential(
@@ -76,11 +78,26 @@ class CNNVAE(nn.Module):
             nn.Dropout2d(0.2)
         ) 
 
-        # Latent space parameters
-        self.fc_mu = nn.Linear(128 * 4 * 4, latent_dim)      # Mean
-        self.fc_logvar = nn.Linear(128 * 4 * 4, latent_dim)  # Log variance
-
         # Decoder
+        self.up3  = nn.ConvTranspose2d(256, 128, 2, stride=2)  # 32 -> 64
+        self.dec3 = nn.Sequential(
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Dropout2d(0.2)
+        )
+
+        self.up2  = nn.ConvTranspose2d(128, 64, 2, stride=2)   # 64 -> 128
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Dropout2d(0.2)
+        )
+
+        self.up1  = nn.ConvTranspose2d(64, 32, 2, stride=2)    # 128 -> 256
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Dropout2d(0.2)
+        )
+
+        self.outc = nn.Conv2d(32, n_classes, kernel_size=1)    # final logits
         
     #  encode returns feature maps
     def encode(self, x):
@@ -89,12 +106,16 @@ class CNNVAE(nn.Module):
         x3 = self.enc3(self.pool2(x2))    # [B,128,  64,  64]
         xb = self.bottleneck(self.pool3(x3))  # [B,256, 32, 32]
         return x1, x2, x3, xb
+    
+    def decode(self, xb):
+        y = self.up3(xb); y = self.dec3(y)      # -> [B,128, 64, 64]
+        y = self.up2(y);  y = self.dec2(y)      # -> [B, 64,128,128]
+        y = self.up1(y);  y = self.dec1(y)      # -> [B, 32,256,256]
+        return self.outc(y)                     # -> [B,C,256,256]
 
     # forward: head at 32×32, then upsample back to H×W
     def forward(self, x):
-        x1, x2, x3, xb = self.encode(x)
-        logits32 = self.out_head(xb)  # [B, C, 32, 32]
-        return F.interpolate(logits32, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        return 
 
 
 ce_loss = nn.CrossEntropyLoss()
