@@ -7,6 +7,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision.io import read_image  
 import os
+import matplotlib.pyplot as plt
+
+DEMO = True
+CKPT = "unet_best.pt"
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -14,7 +18,6 @@ if not torch.cuda.is_available():
     print("Warning CUDA not Found. Using CPU")
 
 # Hyper-parameters
-num_epochs = 8
 learning_rate = 1e-3
 
 class FlatPngSegDataset(Dataset):
@@ -27,29 +30,42 @@ class FlatPngSegDataset(Dataset):
     def __len__(self): return len(self.imgs)
 
     def __getitem__(self, i):
-        # image -> [1,H,W] in [0,1]
         x = read_image(self.imgs[i]).float() / 255.0
-        if x.size(0) >= 3: x = x[:3].mean(0, keepdim=True)
+        if x.size(0) >= 3:
+            x = x[:3].mean(0, keepdim=True)
         x = F.interpolate(x.unsqueeze(0), self.size, mode="bilinear", align_corners=False).squeeze(0)
 
-        lab = read_image(self.masks[i])[0:1].long()            # [1,H,W] uint/long
-        lab = F.interpolate(lab.float().unsqueeze(0), self.size, mode="nearest").squeeze(0).long()  # keep ids
-        y = lab.squeeze(0)    
+        lab = read_image(self.masks[i])[0:1].long()
+        lab = F.interpolate(lab.float().unsqueeze(0), self.size, mode="nearest").squeeze(0).long()
         
-        return x, y
-    
+        # remap values {0,85,170,255} -> {0,1,2,3}
+        mapping = {0:0, 85:1, 170:2, 255:3}
+        y = torch.zeros_like(lab)
+        for k,v in mapping.items():
+            y[lab==k] = v
 
-img_tr = "../keras_png_slices_data/keras_png_slices_train"
-msk_tr = "../keras_png_slices_data/keras_png_slices_seg_train"
-img_va = "../keras_png_slices_data/keras_png_slices_validate"
-msk_va = "../keras_png_slices_data/keras_png_slices_seg_validate"
+        return x, y.squeeze(0)   # ensure shape [H,W]
+
+
+    
+root = "../keras_png_slices_data"
+
+img_tr = f"{root}/keras_png_slices_train"
+msk_tr = f"{root}/keras_png_slices_seg_train"
+img_va = f"{root}/keras_png_slices_validate"
+msk_va = f"{root}/keras_png_slices_seg_validate"
 
 trainset = FlatPngSegDataset(img_tr, msk_tr, size=(256,256))
 valset   = FlatPngSegDataset(img_va, msk_va, size=(256,256))
 train_loader = DataLoader(trainset, batch_size=8, shuffle=True)
 val_loader   = DataLoader(valset,   batch_size=8, shuffle=False)
 
+
 n_classes = 4 #since tehre are 4 labels
+
+for x, y in train_loader:
+    print(torch.unique(y))
+    break
 
 class UNetCNN(nn.Module):
     def __init__(self, n_classes):
@@ -149,57 +165,115 @@ def dice_per_class(logits: torch.Tensor, y: torch.Tensor, n_classes: int, eps: f
     union = probs.sum(dims) + y1h.sum(dims)                    # [C]
     return (2*inter + eps) / (union + eps)                     # [C]
 
+@torch.inference_mode()
 def evaluate(net: nn.Module, loader: DataLoader, n_classes: int):
     net.eval()
+
     ce_sum = 0.0
     px_correct = 0
     px_total   = 0
 
-    # accumulate exact Dice numerators/denominators
-    inter_sum = torch.zeros(n_classes, device=device)
-    union_sum = torch.zeros(n_classes, device=device)
+    inter_sum = torch.zeros(n_classes, device='cpu')   # keep accumulators on CPU
+    union_sum = torch.zeros(n_classes, device='cpu')
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        logits = net(x)
 
-        # CE
+        logits = net(x)                                # no graph is created
         ce_sum += ce_loss(logits, y).item() * x.size(0)
 
         # pixel accuracy
-        pred = logits.argmax(1)                   # [B,H,W]
+        pred = logits.argmax(1)
         px_correct += (pred == y).sum().item()
         px_total   += y.numel()
 
-        # per-class Dice accumulators
-        probs = torch.softmax(logits, dim=1)      # [B,C,H,W]
-        y1h   = torch.nn.functional.one_hot(y, n_classes).permute(0,3,1,2).float()
+        # per-class Dice (do math on GPU, then move the small result to CPU)
+        probs = logits.softmax(1)
+        y1h   = torch.nn.functional.one_hot(y, n_classes).permute(0,3,1,2).to(probs.dtype)
+
         dims  = (0,2,3)
-        inter_sum += (probs * y1h).sum(dims)
-        union_sum += probs.sum(dims) + y1h.sum(dims)
+        inter = (probs * y1h).sum(dims).detach().cpu()
+        union = (probs.sum(dims) + y1h.sum(dims)).detach().cpu()
+
+        inter_sum += inter
+        union_sum += union
 
     ce_avg  = ce_sum / len(loader.dataset)
     acc_px  = px_correct / px_total
-    dice_pc = (2*inter_sum / union_sum.clamp_min(1e-6)).detach().cpu().tolist()
+    dice_pc = (2*inter_sum / union_sum.clamp_min(1e-6)).tolist()
     return ce_avg, acc_px, dice_pc
 
+@torch.inference_mode()
+def save_segmentation_figures(net, dataset, indices=(0,5,12), out_dir="figures", prefix="val"):
+    os.makedirs(out_dir, exist_ok=True)
+    net.eval()
+    for idx in indices:
+        x, y = dataset[idx]                             # x:[1,H,W], y:[H,W]
+        pred = net(x.unsqueeze(0).to(device)).argmax(1).squeeze(0).cpu()
 
-# Training loop
-net = UNetCNN(n_classes).to(device)
-opt = torch.optim.Adam(net.parameters(), lr=learning_rate)
+        # Triplet
+        fig, axs = plt.subplots(1, 3, figsize=(12,4))
+        axs[0].imshow(x.squeeze(0), cmap="gray");           axs[0].set_title("Input");        axs[0].axis("off")
+        axs[1].imshow(y, cmap="nipy_spectral");             axs[1].set_title("Ground Truth"); axs[1].axis("off")
+        axs[2].imshow(pred, cmap="nipy_spectral");          axs[2].set_title("Predicted");    axs[2].axis("off")
+        fig.tight_layout()
+        fig.savefig(f"{out_dir}/{prefix}_triplet_{idx}.png", dpi=150)
+        plt.close(fig)
 
-for epoch in range(10):
-    net.train(); running=0.0
-    for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
-        opt.zero_grad()
-        logits = net(x)
-        loss = ce_loss(logits, y) + 0.5 * dice_loss(logits, y)   # keep CE + Dice loss for stability
-        loss.backward()
-        opt.step()
-        running += loss.item() * x.size(0)
+        # Overlay
+        fig = plt.figure(figsize=(4,4))
+        plt.imshow(x.squeeze(0), cmap="gray")
+        plt.imshow(pred, cmap="nipy_spectral", alpha=0.45, interpolation="nearest")
+        plt.title(f"{prefix} idx={idx}"); plt.axis("off")
+        fig.savefig(f"{out_dir}/{prefix}_overlay_{idx}.png", dpi=150)
+        plt.close(fig)
 
-    # evaluate on validation set
-    ce_v, acc_v, dice_pc = evaluate(net, val_loader, n_classes)
-    print(f"epoch {epoch+1:02d} | train_loss {running/len(trainset):.4f} "
-          f"| val_CE {ce_v:.4f} | val_pxAcc {acc_v:.3f} | val_DSC per-class {dice_pc}")
+
+if not DEMO:
+    best_mDSC = -1.0
+    # Training loop
+    net = UNetCNN(n_classes).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=learning_rate)
+
+    for epoch in range(20):
+        net.train(); running = 0.0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            logits = net(x)
+            loss = ce_loss(logits, y) + 0.5 * dice_loss(logits, y)
+            loss.backward()
+            opt.step()
+            running += loss.item() * x.size(0)
+
+        ce_v, acc_v, dice_pc = evaluate(net, val_loader, n_classes)
+        mDSC = sum(dice_pc)/len(dice_pc)
+        print(f"epoch {epoch+1:02d} | train_loss {running/len(trainset):.4f} "
+            f"| val_CE {ce_v:.4f} | val_pxAcc {acc_v:.3f} | val_DSC per-class {dice_pc} | mDSC {mDSC:.3f}")
+
+        if mDSC > best_mDSC:
+            best_mDSC = mDSC
+            torch.save(net.state_dict(), CKPT)
+            print(f"[ckpt] saved new best -> {CKPT} (mDSC={best_mDSC:.3f})")
+
+    save_segmentation_figures(net, valset, indices=(0,5,12,20), out_dir="figures", prefix="val")
+
+
+img_te = f"{root}/keras_png_slices_test"
+msk_te = f"{root}/keras_png_slices_seg_test"
+testset = FlatPngSegDataset(img_te, msk_te, size=(256,256))
+test_loader = DataLoader(testset, batch_size=8, shuffle=False)
+
+if DEMO:
+    net = UNetCNN(n_classes).to(device)
+    net.load_state_dict(torch.load(CKPT, map_location=device))
+    net.eval()
+    print(f"loaded checkpoint from {CKPT}")
+
+    ce_t, acc_t, dice_pc_t = evaluate(net, test_loader, n_classes)
+    mDSC_t = sum(dice_pc_t)/len(dice_pc_t)
+    print("test_pxAcc:", f"{acc_t:.3f}")
+    print("test_DSC per-class:", [f"{d:.3f}" for d in dice_pc_t])
+
+
+
