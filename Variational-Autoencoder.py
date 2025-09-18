@@ -17,6 +17,10 @@ if not torch.cuda.is_available():
 num_epochs = 8
 learning_rate = 1e-3
 
+#loads PNGs from a folder
+#converts them to grayscale for precaution
+#resizes them to 28x28 to make sure universally same size
+#returns a dummy label (0) since this is unsupervised
 class FlatPngDataset(Dataset):
     def __init__(self, root, size=(28, 28)):
         self.paths = [os.path.join(root, f)
@@ -29,7 +33,7 @@ class FlatPngDataset(Dataset):
 
     def __getitem__(self, idx):
         # read_image -> uint8 [C,H,W], C can be 1 (grayscale) or 3/4 (RGB/RGBA)
-        x = read_image(self.paths[idx]).float() / 255.0  # -> [C,H,W] in [0,1]
+        x = read_image(self.paths[idx]).float() / 255.0
         if x.size(0) == 3:           # RGB -> gray
             x = x.mean(0, keepdim=True)
         elif x.size(0) == 4:         # RGBA -> RGB -> gray
@@ -37,15 +41,17 @@ class FlatPngDataset(Dataset):
         # ensure 28x28
         x = F.interpolate(x.unsqueeze(0), size=self.size, mode="bilinear",
                           align_corners=False).squeeze(0)
-        return x, 0                   # dummy label
+        return x, 0
     
 
+# Load dataset
 train_root = "../keras_png_slices_data/keras_png_slices_train"
 val_root   = "../keras_png_slices_data/keras_png_slices_validate"
 
 trainset = FlatPngDataset(train_root, size=(28, 28))
 testset  = FlatPngDataset(val_root,   size=(28, 28))
 
+# Data loaders
 train_loader = DataLoader(trainset, batch_size=128, shuffle=True)
 test_loader  = DataLoader(testset,  batch_size=128, shuffle=False)
 
@@ -189,7 +195,7 @@ for epoch in range(num_vae_epochs):
 
 # Manifold visualisation
 
-
+#sweep two latent dimensions over a grid and decode each point.
 def plot_decoder_manifold_grid(model, latent_dim, device,
                                n=15, lim=3.0,
                                savepath="outputs/vae_manifold_grid.png",

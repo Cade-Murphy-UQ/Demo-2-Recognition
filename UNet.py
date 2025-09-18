@@ -20,6 +20,9 @@ if not torch.cuda.is_available():
 # Hyper-parameters
 learning_rate = 1e-3
 
+# resize inputs with bilinear interpolation (smooth).
+# resize masks with nearest-neighbor to avoid mixing class ids.
+# remap 8-bit label colors {0,85,170,255} → {0,1,2,3}.
 class FlatPngSegDataset(Dataset):
     def __init__(self, img_root, mask_root, size=(256,256)):
         self.imgs  = sorted([os.path.join(img_root,  f) for f in os.listdir(img_root)  if f.endswith(".png")])
@@ -47,7 +50,7 @@ class FlatPngSegDataset(Dataset):
         return x, y.squeeze(0)   # ensure shape [H,W]
 
 
-    
+#root modifying for when using rangpur cluster
 root = "../keras_png_slices_data"
 
 img_tr = f"{root}/keras_png_slices_train"
@@ -60,18 +63,17 @@ valset   = FlatPngSegDataset(img_va, msk_va, size=(256,256))
 train_loader = DataLoader(trainset, batch_size=8, shuffle=True)
 val_loader   = DataLoader(valset,   batch_size=8, shuffle=False)
 
+# number of classes in the images
+n_classes = 4 
 
-n_classes = 4 #since tehre are 4 labels
-
-for x, y in train_loader:
-    print(torch.unique(y))
-    break
 
 class UNetCNN(nn.Module):
     def __init__(self, n_classes):
         super().__init__()
 
         # Encoder
+        # We use small conv blocks + BN + ReLU (+ dropout for regularization)
+        # Goal is for feature extraction
         self.enc1 = nn.Sequential(
             nn.Conv2d(1, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
             nn.Dropout2d(0.2)
@@ -95,7 +97,10 @@ class UNetCNN(nn.Module):
             nn.Dropout2d(0.2)
         ) 
 
-        # Decoder
+        # Decoder 
+        # we upsample then use conv blocks + BN + ReLU (+ dropout)
+        # Goal is to reconstruct the segmentation map
+        # We also concatenate skip connections from the encoder
         self.up3  = nn.ConvTranspose2d(256, 128, 2, stride=2)                  # 32→64
         self.dec3 = nn.Sequential(
             nn.Conv2d(128 + 128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
@@ -116,7 +121,7 @@ class UNetCNN(nn.Module):
 
         self.outc = nn.Conv2d(32, n_classes, kernel_size=1)    # final logits
         
-    #  encode returns feature maps
+    # encode by run downsampling path and keep skip features for later concat
     def encode(self, x):
         x1 = self.enc1(x)                 # [B, 32, 256, 256]
         x2 = self.enc2(self.pool1(x1))    # [B, 64, 128, 128]
@@ -124,6 +129,7 @@ class UNetCNN(nn.Module):
         xb = self.bottleneck(self.pool3(x3))  # [B,256, 32, 32]
         return x1, x2, x3, xb
     
+    #decode by upsample and fuse with corresponding encoder features (skip connections)
     def decode(self, x1, x2, x3, xb):
         y = self.up3(xb)                            # [B,128, 64, 64]
         y = torch.cat([y, x3], dim=1)               # [B,256, 64, 64]
@@ -145,8 +151,9 @@ class UNetCNN(nn.Module):
         return self.decode(x1, x2, x3, xb)
 
 
-ce_loss = nn.CrossEntropyLoss()
 
+# dice loss encourages overlap, we combine both dice loss and crossentropy loss for stability + quality
+ce_loss = nn.CrossEntropyLoss()
 def dice_loss(logits, target, eps=1e-6):
     probs = torch.softmax(logits, dim=1)
     tgt1h = torch.nn.functional.one_hot(target, probs.shape[1])
@@ -157,6 +164,7 @@ def dice_loss(logits, target, eps=1e-6):
     dice  = (2*inter + eps) / (union + eps)
     return 1.0 - dice.mean()
 
+#We compute soft Dice on the whole loader and return [C] dice values
 def dice_per_class(logits: torch.Tensor, y: torch.Tensor, n_classes: int, eps: float = 1e-6):
     probs = torch.softmax(logits, dim=1)                       # [B,C,H,W]
     y1h   = torch.nn.functional.one_hot(y, n_classes).permute(0,3,1,2).float()  # [B,C,H,W]
@@ -165,6 +173,9 @@ def dice_per_class(logits: torch.Tensor, y: torch.Tensor, n_classes: int, eps: f
     union = probs.sum(dims) + y1h.sum(dims)                    # [C]
     return (2*inter + eps) / (union + eps)                     # [C]
 
+#Cross-entropy on raw logits
+#Pixel accuracy (hard argmax)
+#Per-class Dice computed by accumulating intersections/unions over the loader
 @torch.inference_mode()
 def evaluate(net: nn.Module, loader: DataLoader, n_classes: int):
     net.eval()
@@ -203,6 +214,7 @@ def evaluate(net: nn.Module, loader: DataLoader, n_classes: int):
     dice_pc = (2*inter_sum / union_sum.clamp_min(1e-6)).tolist()
     return ce_avg, acc_px, dice_pc
 
+#Save triplets (Input | GT | Pred) and overlays for qualitative evidence used for justifying dice scores
 @torch.inference_mode()
 def save_segmentation_figures(net, dataset, indices=(0,5,12), out_dir="figures", prefix="val"):
     os.makedirs(out_dir, exist_ok=True)
@@ -229,6 +241,10 @@ def save_segmentation_figures(net, dataset, indices=(0,5,12), out_dir="figures",
         plt.close(fig)
 
 
+#TRAINING BLOCK
+#   Loss is CE + 0.5 * Dice 
+#   Saves best checkpoint by validation mean DSC
+#   Saves a few validation figures
 if not DEMO:
     best_mDSC = -1.0
     # Training loop
@@ -259,6 +275,10 @@ if not DEMO:
     save_segmentation_figures(net, valset, indices=(0,5,12,20), out_dir="figures", prefix="val")
 
 
+
+#DEMO interference
+# no training
+# load the best checkpoint and evaluate on the test set
 img_te = f"{root}/keras_png_slices_test"
 msk_te = f"{root}/keras_png_slices_seg_test"
 testset = FlatPngSegDataset(img_te, msk_te, size=(256,256))
